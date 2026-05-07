@@ -64,11 +64,40 @@ function getToolPath(args: unknown): string | undefined {
 // Match pi's current edit schema: { path, edits: [{ oldText, newText }] }, with
 // legacy top-level oldText/newText still accepted. Pi also normalizes stringified edits.
 // https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/tools/edit.ts
+function getParsedEdits(args: unknown): Array<{ oldText: string; newText: string }> {
+  const record = args as { oldText?: unknown; newText?: unknown; edits?: unknown } | null | undefined
+  const parsed: Array<{ oldText: string; newText: string }> = []
+
+  if (typeof record?.oldText === 'string' && typeof record?.newText === 'string') {
+    parsed.push({ oldText: record.oldText, newText: record.newText })
+  }
+
+  let edits = record?.edits
+  if (typeof edits === 'string') {
+    try {
+      edits = JSON.parse(edits) as unknown
+    } catch {
+      edits = undefined
+    }
+  }
+
+  if (Array.isArray(edits)) {
+    for (const edit of edits) {
+      const item = edit as { oldText?: unknown; newText?: unknown } | null | undefined
+      if (typeof item?.oldText === 'string' && typeof item?.newText === 'string') {
+        parsed.push({ oldText: item.oldText, newText: item.newText })
+      }
+    }
+  }
+
+  return parsed
+}
+
 function getEditOldTexts(args: unknown): string[] {
   const record = args as { oldText?: unknown; edits?: unknown } | null | undefined
-  const oldTexts: string[] = []
+  const oldTexts = getParsedEdits(args).map(edit => edit.oldText)
 
-  if (typeof record?.oldText === 'string') oldTexts.push(record.oldText)
+  if (typeof record?.oldText === 'string' && !oldTexts.includes(record.oldText)) oldTexts.push(record.oldText)
 
   let edits = record?.edits
   if (typeof edits === 'string') {
@@ -82,7 +111,7 @@ function getEditOldTexts(args: unknown): string[] {
   if (Array.isArray(edits)) {
     for (const edit of edits) {
       const oldText = (edit as { oldText?: unknown } | null | undefined)?.oldText
-      if (typeof oldText === 'string') oldTexts.push(oldText)
+      if (typeof oldText === 'string' && !oldTexts.includes(oldText)) oldTexts.push(oldText)
     }
   }
 
@@ -234,10 +263,11 @@ export class PiAcpSession {
   // The overall agent loop completes when `agent_end` is emitted.
   private inAgentLoop = false
 
-  // For ACP diff support: capture file contents before edits, then emit ToolCallContent {type:"diff"}.
-  // This is due to pi sending diff as a string as opposed to ACP expected diff format.
-  // Compatible format may need to be implemented in pi in the future.
-  private editSnapshots = new Map<string, { path: string; oldText: string }>()
+  // For ACP diff support: capture file contents before edit/write mutations,
+  // then emit ToolCallContent {type:"diff"}. Compatible structured edit/write
+  // events may need to be implemented in pi in the future.
+  private fileSnapshots = new Map<string, { path: string; oldText: string | null }>()
+  private fileMutationToolCallIds = new Set<string>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -513,21 +543,27 @@ export class PiAcpSession {
         const args = (ev as any).args
         let line: number | undefined
 
-        // Capture pre-edit file contents so we can emit a structured ACP diff on completion.
-        if (toolName === 'edit') {
+        // Capture pre-mutation file contents so we can emit a structured ACP diff.
+        const isFileMutation = toolName === 'edit' || toolName === 'write'
+        let snapshotOldText: string | null | undefined
+        if (isFileMutation) {
+          this.fileMutationToolCallIds.add(toolCallId)
           const p = getToolPath(args)
           if (p) {
             try {
               const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
-              const oldText = readFileSync(abs, 'utf8')
-              this.editSnapshots.set(toolCallId, { path: p, oldText })
+              snapshotOldText = readFileSync(abs, 'utf8')
+              this.fileSnapshots.set(toolCallId, { path: p, oldText: snapshotOldText })
 
-              for (const needle of getEditOldTexts(args)) {
-                line = findUniqueLineNumber(oldText, needle)
-                if (typeof line === 'number') break
+              if (toolName === 'edit') {
+                for (const needle of getEditOldTexts(args)) {
+                  line = findUniqueLineNumber(snapshotOldText, needle)
+                  if (typeof line === 'number') break
+                }
               }
             } catch {
-              // Ignore snapshot failures; we'll fall back to plain text output.
+              snapshotOldText = null
+              this.fileSnapshots.set(toolCallId, { path: p, oldText: null })
             }
           }
         }
@@ -565,7 +601,7 @@ export class PiAcpSession {
         if (!toolCallId) break
 
         const partial = (ev as any).partialResult
-        const text = toolResultToText(partial)
+        const text = this.fileMutationToolCallIds.has(toolCallId) ? '' : toolResultToText(partial)
 
         this.emit({
           sessionUpdate: 'tool_call_update',
@@ -574,7 +610,7 @@ export class PiAcpSession {
           content: text
             ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
             : undefined,
-          rawOutput: partial
+          ...(this.fileMutationToolCallIds.has(toolCallId) ? {} : { rawOutput: partial })
         })
         break
       }
@@ -587,24 +623,23 @@ export class PiAcpSession {
         const isError = Boolean((ev as any).isError)
         const text = toolResultToText(result)
 
-        // If this was an edit and we captured a snapshot, emit a structured ACP diff.
-        // This enables clients like Zed to render an actual diff UI.
-        const snapshot = this.editSnapshots.get(toolCallId)
+        const snapshot = this.fileSnapshots.get(toolCallId)
         let content: ToolCallContent[] | undefined
+        let hasStructuredDiff = false
 
         if (!isError && snapshot) {
           try {
             const abs = isAbsolute(snapshot.path) ? snapshot.path : resolvePath(this.cwd, snapshot.path)
             const newText = readFileSync(abs, 'utf8')
-            if (newText !== snapshot.oldText) {
+            if (snapshot.oldText === null || newText !== snapshot.oldText) {
+              hasStructuredDiff = true
               content = [
                 {
                   type: 'diff',
                   path: snapshot.path,
                   oldText: snapshot.oldText,
                   newText
-                },
-                ...(text ? ([{ type: 'content', content: { type: 'text', text } }] as ToolCallContent[]) : [])
+                }
               ]
             }
           } catch {
@@ -612,8 +647,7 @@ export class PiAcpSession {
           }
         }
 
-        // Fallback: just text content.
-        if (!content && text) {
+        if (!content && !hasStructuredDiff && text) {
           content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
         }
 
@@ -622,11 +656,12 @@ export class PiAcpSession {
           toolCallId,
           status: isError ? 'failed' : 'completed',
           content,
-          rawOutput: result
+          ...(hasStructuredDiff ? {} : { rawOutput: result })
         })
 
         this.currentToolCalls.delete(toolCallId)
-        this.editSnapshots.delete(toolCallId)
+        this.fileSnapshots.delete(toolCallId)
+        this.fileMutationToolCallIds.delete(toolCallId)
         break
       }
 
