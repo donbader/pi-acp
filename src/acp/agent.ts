@@ -1149,6 +1149,7 @@ export class PiAcpAgent implements ACPAgent {
         messageCount: typeof stats?.totalMessages === 'number' ? stats.totalMessages : (typeof state?.messageCount === 'number' ? state.messageCount : null),
         cost: typeof stats?.cost === 'number' ? stats.cost : null,
         tokens,
+        contextUsage: stats?.contextUsage ?? null,
         sessionFile: typeof state?.sessionFile === 'string' ? state.sessionFile : null,
       }
     }
