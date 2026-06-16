@@ -494,7 +494,35 @@ export class PiAcpSession {
     // Kick off pi, but completion is determined by pi events, not the RPC response.
     // Important: pi may emit multiple `turn_end` events (e.g. when the model requests tools).
     // The full prompt is finished when we see `agent_end`.
-    this.proc.prompt(t.message, t.images).catch(err => {
+    this.proc.prompt(t.message, t.images).then(() => {
+      // If proc.prompt() resolved successfully but the agent loop never started,
+      // the prompt was handled by an extension command (e.g. /evolve) that returned
+      // without triggering the LLM. In this case, no `agent_end` event will ever come,
+      // so we must resolve the turn here.
+      if (!this.inAgentLoop && this.pendingTurn) {
+        console.error(`[pi-acp-debug] prompt resolved without agent loop — resolving turn as end_turn`)
+        void this.flushEmits().finally(() => {
+          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+          this.pendingTurn?.resolve(reason)
+          this.pendingTurn = null
+          this.inAgentLoop = false
+
+          const next = this.turnQueue.shift()
+          if (next) {
+            this.emit({
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+            })
+            this.startTurn(next)
+          } else {
+            this.emit({
+              sessionUpdate: 'session_info_update',
+              _meta: { piAcp: { queueDepth: 0, running: false } }
+            })
+          }
+        })
+      }
+    }).catch(err => {
       // If the subprocess errors before we get an `agent_end`, treat as error unless cancelled.
       // Also ensure we flush any already-enqueued updates first.
       void this.flushEmits().finally(() => {
