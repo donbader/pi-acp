@@ -380,6 +380,7 @@ export class PiAcpSession {
   }
 
   async cancel(): Promise<void> {
+    console.error(`[pi-acp-debug] cancel() called for session ${this.sessionId}`)
     // Cancel current and clear any queued prompts.
     this.cancelRequested = true
 
@@ -916,15 +917,20 @@ export class PiAcpSession {
       kind: 'allow_once'
     }))
 
+    console.error(`[pi-acp-debug] handleExtensionSelect: requesting permission, id=${id}, options=${options.length}`)
     const selected = await this.requestExtensionPermission(id, ev, permissionOptions)
+    console.error(`[pi-acp-debug] handleExtensionSelect: permission returned, selected=${JSON.stringify(selected?.outcome)}`)
     if (selected === null) {
+      console.error(`[pi-acp-debug] handleExtensionSelect: selected is null, returning`)
       return
     }
 
     const selectedOptionId = selected.outcome.outcome === 'selected' ? selected.outcome.optionId : null
     const index = selectedOptionId === null ? null : optionIndex(selectedOptionId)
     const value = index === null ? null : (options.at(index) ?? null)
+    console.error(`[pi-acp-debug] handleExtensionSelect: sending extensionUiResponse, value=${value}, cancelled=${value === null}`)
     await this.proc.sendExtensionUiResponse(value === null ? { id, cancelled: true } : { id, value })
+    console.error(`[pi-acp-debug] handleExtensionSelect: done`)
   }
 
   private async handleExtensionConfirm(ev: PiRpcEvent, id: string): Promise<void> {
