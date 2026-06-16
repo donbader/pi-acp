@@ -886,14 +886,7 @@ export class PiAcpSession {
     }
 
     if (method === 'input' || method === 'editor') {
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: {
-          type: 'text',
-          text: `Pi ${method} UI request is not supported in ACP yet; cancelling it.`
-        } satisfies ContentBlock
-      })
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      await this.handleExtensionInput(ev, id)
       return
     }
 
@@ -946,6 +939,26 @@ export class PiAcpSession {
     }
 
     await this.proc.sendExtensionUiResponse({ id, confirmed: selected.outcome.optionId === 'yes' })
+  }
+
+  private async handleExtensionInput(ev: PiRpcEvent, id: string): Promise<void> {
+    const INPUT_OPTIONS: PermissionOption[] = [
+      { optionId: 'text_input', name: 'Type your response', kind: 'text_input' as any }
+    ]
+
+    const selected = await this.requestExtensionPermission(id, ev, INPUT_OPTIONS)
+    if (selected === null) {
+      return
+    }
+
+    if (selected.outcome.outcome === 'cancelled') {
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      return
+    }
+
+    // The adapter puts user's text in a 'text' field on the response
+    const text = (selected as any).text ?? ''
+    await this.proc.sendExtensionUiResponse({ id, value: text })
   }
 
   private async requestExtensionPermission(
