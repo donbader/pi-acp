@@ -499,28 +499,37 @@ export class PiAcpSession {
       // the prompt was handled by an extension command (e.g. /evolve) that returned
       // without triggering the LLM. In this case, no `agent_end` event will ever come,
       // so we must resolve the turn here.
+      //
+      // We use a short delay because for normal prompts, preflightResult fires BEFORE
+      // _runAgentPrompt starts, so there's a brief window where proc.prompt() has resolved
+      // but agent_start hasn't arrived yet. 3 seconds is enough for agent_start to arrive
+      // via IPC for normal prompts, but short enough to not leave the user waiting.
       if (!this.inAgentLoop && this.pendingTurn) {
-        console.error(`[pi-acp-debug] prompt resolved without agent loop — resolving turn as end_turn`)
-        void this.flushEmits().finally(() => {
-          const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
-          this.pendingTurn?.resolve(reason)
-          this.pendingTurn = null
-          this.inAgentLoop = false
+        setTimeout(() => {
+          if (!this.inAgentLoop && this.pendingTurn) {
+            console.error(`[pi-acp-debug] prompt resolved without agent loop after timeout — resolving turn as end_turn`)
+            void this.flushEmits().finally(() => {
+              const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+              this.pendingTurn?.resolve(reason)
+              this.pendingTurn = null
+              this.inAgentLoop = false
 
-          const next = this.turnQueue.shift()
-          if (next) {
-            this.emit({
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-            })
-            this.startTurn(next)
-          } else {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
+              const next = this.turnQueue.shift()
+              if (next) {
+                this.emit({
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+                })
+                this.startTurn(next)
+              } else {
+                this.emit({
+                  sessionUpdate: 'session_info_update',
+                  _meta: { piAcp: { queueDepth: 0, running: false } }
+                })
+              }
             })
           }
-        })
+        }, 3000)
       }
     }).catch(err => {
       // If the subprocess errors before we get an `agent_end`, treat as error unless cancelled.
